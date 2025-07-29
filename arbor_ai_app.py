@@ -8,7 +8,7 @@ og gjøre enkel OCR av opplastede bilder. Kjør koden med:
     streamlit run arbor_ai_app.py
 
 Du må ha installert avhengighetene:
-    pip install streamlit pandas numpy scikit-learn plotly easyocr
+    pip install streamlit pandas numpy scikit-learn plotly easyocr pillow
 
 Opprettet: juli 2025
 """
@@ -36,9 +36,14 @@ except ImportError:
 
 try:
     import pytesseract  # type: ignore
-    from PIL import Image  # type: ignore
 except ImportError:
     pytesseract = None  # type: ignore
+
+# Sørg for at Pillow alltid er importert hvis det finnes
+try:
+    from PIL import Image  # type: ignore
+except ImportError:
+    Image = None  # type: ignore
 
 from sklearn.linear_model import LinearRegression  # type: ignore
 
@@ -91,8 +96,10 @@ def suggest_ai_feed(model: LinearRegression, sample: np.ndarray) -> float:
 def perform_easyocr(img_bytes: bytes) -> str:
     """Utfør OCR med EasyOCR."""
     if easyocr is None:
-        return "EasyOCR er ikke installert. Installer via pip install easyocr."
-    image = Image.open(io.BytesIO(img_bytes))  # type: ignore[name-defined]
+        return "EasyOCR er ikke installert. Installer via `pip install easyocr` for å aktivere denne funksjonen."
+    if Image is None:
+        return "Pillow er ikke installert. Installer via `pip install pillow` for å lese bilder."
+    image = Image.open(io.BytesIO(img_bytes))
     reader = easyocr.Reader(["en"])
     result = reader.readtext(np.array(image), detail=0)
     return "\n".join(result)
@@ -101,7 +108,9 @@ def perform_easyocr(img_bytes: bytes) -> str:
 def perform_pytesseract(img_bytes: bytes) -> str:
     """Utfør OCR med pytesseract."""
     if pytesseract is None:
-        return "pytesseract er ikke installert. Installer via pip install pytesseract."
+        return "pytesseract er ikke installert. Installer via `pip install pytesseract` og sørg for at Tesseract-motoren er tilgjengelig."
+    if Image is None:
+        return "Pillow er ikke installert. Installer via `pip install pillow` for å lese bilder."
     image = Image.open(io.BytesIO(img_bytes))
     try:
         text = pytesseract.image_to_string(image)
@@ -125,11 +134,9 @@ def main() -> None:
         """
     )
 
-    # Initier data hvis det ikke finnes fra før
     if "data" not in st.session_state:
         st.session_state["data"] = initialise_data()
 
-    # Sidebar for logging
     st.sidebar.header("Loggføring")
     if st.sidebar.button("Simuler sensormåling"):
         temp, air, bunk, hum, m_feed = simulate_sensor_reading()
@@ -175,7 +182,6 @@ def main() -> None:
             ignore_index=True,
         )
 
-    # Vis data og tren modell
     data = st.session_state["data"]
     if not data.empty:
         st.subheader("Historiske data")
@@ -188,7 +194,6 @@ def main() -> None:
             ai_prediction = suggest_ai_feed(model, np.array(sample, dtype=float))
             st.session_state["data"].at[idx, "ai_feed"] = ai_prediction
 
-        # Plot prosessdata
         st.subheader("Prosessvariabler over tid")
         fig = px.line(
             st.session_state["data"],
@@ -199,7 +204,6 @@ def main() -> None:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Plot manual vs AI
         st.subheader("Sammenligning av manuell vs AI‑styrt mating")
         comp_fig = px.line(
             st.session_state["data"],
@@ -217,7 +221,6 @@ def main() -> None:
                 f"Det er {high_dev.sum()} logg(r) med mer enn 15 % avvik mellom manuell og AI‑mating."
             )
 
-    # OCR
     st.subheader("Bildeopplasting og avlesning")
     st.write(
         "Last opp et bilde av en manuell måling (f.eks. foto av et fuktighetsinstrument) for å lese av verdien automatisk."
@@ -233,7 +236,6 @@ def main() -> None:
                 text_out = perform_pytesseract(img_bytes)
         st.text_area("Ekstrahert tekst", value=text_out, height=200)
 
-    # Prediktivt vedlikehold
     st.subheader("Prediktivt vedlikehold (eksempel)")
     st.write(
         "Denne seksjonen illustrerer en enkel varslingsmekanisme. Vi beregner et glidende "
