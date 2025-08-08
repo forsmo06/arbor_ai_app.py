@@ -5,3 +5,5 @@ scikit-learn
 plotly
 pillow
 easyocr
+torch
+torchvision
