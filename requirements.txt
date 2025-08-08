@@ -3,7 +3,10 @@ pandas
 numpy
 scikit-learn
 plotly
-pillow
-easyocr
+pilloweasyocr
 torch
 torchvision
+opencv-python-headless
+pillow
+pytesseract
+transformers
