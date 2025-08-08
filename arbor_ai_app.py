@@ -1,16 +1,15 @@
 # arbor_ai_app.py
 # -*- coding: utf-8 -*-
 """
-Arbor AI – samlet Streamlit-app (én fil) med:
+Arbor AI – Streamlit-app med:
 - Modusdeteksjon (Hombak/Maier)
-- Autokalibrering av fuktsensor (RLS m/glemselsfaktor)
-- Dødtidsestimat + forslag til neste prøvetidspunkt
-- Guardrails (hard/soft) per resept + rate-limit
-- «MPC-lite» (ett-trinns fremoversyn / ARX) m/ forklaring
-- DoE-steg (kontrollerte små steg) i rolige perioder
-- KPI-dashboard + A/B-evaluering pr. skift
-- Hendelseslogg og eksport
-- OCR for håndskrevne/avfotograferte loggark (TrOCR → fallback pytesseract)
+- Autokalibrering (RLS)
+- Dødtidsestimat + forslag neste prøvetidspunkt
+- Guardrails + MPC-lite (ett-trinns fremoversyn)
+- KPI-dashboard, hendelseslogg, eksport
+- OCR av håndskrevet/avfotografert loggark:
+  * EasyOCR → fallback TrOCR → fallback Tesseract
+  * Skjema-parser til norske felt (Utløpstemp, Innløpstemp, Hombak, Maier, osv.)
 """
 
 import io
@@ -21,27 +20,32 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# --- Opsjonelle imports for OCR ---
+# --- OCR-bibliotek (alle valgfri; appen håndterer manglende libs) ---
 try:
     from PIL import Image
 except Exception:
     Image = None
 
 try:
-    import pytesseract  # type: ignore
+    import easyocr
 except Exception:
-    pytesseract = None  # type: ignore
+    easyocr = None
 
 try:
     from transformers import TrOCRProcessor, VisionEncoderDecoderModel  # type: ignore
     import torch  # type: ignore
 except Exception:
-    TrOCRProcessor = None  # type: ignore
-    VisionEncoderDecoderModel = None  # type: ignore
-    torch = None  # type: ignore
+    TrOCRProcessor = None
+    VisionEncoderDecoderModel = None
+    torch = None
+
+try:
+    import pytesseract  # type: ignore
+except Exception:
+    pytesseract = None
 
 
-# ============ Utils ============ #
+# ================== Utils / modell ================== #
 
 @st.cache_data
 def load_csv(file) -> pd.DataFrame:
@@ -54,18 +58,8 @@ def load_csv(file) -> pd.DataFrame:
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-def ewma(series: pd.Series, alpha: float = 0.3) -> pd.Series:
-    out, s = [], None
-    for x in series:
-        s = x if s is None else alpha * x + (1 - alpha) * s
-        out.append(s)
-    return pd.Series(out, index=series.index)
-
-
 class RLSCalibrator:
-    """Enkel RLS (Recursive Least Squares) for fuktsensor-korreksjon.
-    Modell: fukt_manuell ≈ a + b * fukt_sensor
-    """
+    """RLS for å korrigere fuktsensor mot manuell prøve: f_manuell ≈ a + b * f_sensor."""
     def __init__(self, lam: float = 0.99, delta: float = 1000.0):
         self.lam = lam
         self.theta = np.array([0.0, 1.0])  # [a, b]
@@ -93,34 +87,29 @@ def detect_mode(hombak_pc: float, maier_pc: float) -> float:
 
 
 def estimate_dead_time_minutes(df: pd.DataFrame, col_input: str, col_output: str, search_max_min: int = 60) -> int:
-    """Grovt dødtidsestimat via krysskorrelasjon på avledede endringer."""
+    """Grovt dødtidsestimat via krysskorrelasjon på differanser."""
     x = df[col_input].diff().fillna(0).values
     y = df[col_output].diff().fillna(0).values
     n = min(len(x), len(y))
-    x = x[-n:]
-    y = y[-n:]
+    x = x[-n:]; y = y[-n:]
     best_lag, best_corr = 0, -9e9
     for lag in range(0, search_max_min + 1):
         if lag == 0:
             corr = np.corrcoef(x, y)[0, 1] if np.std(x) > 0 and np.std(y) > 0 else 0
         else:
             corr = np.corrcoef(x[:-lag], y[lag:])[0, 1] if np.std(x[:-lag]) > 0 and np.std(y[lag:]) > 0 else 0
-        if np.isnan(corr):
-            corr = 0
+        if np.isnan(corr): corr = 0
         if corr > best_corr:
             best_corr, best_lag = corr, lag
-    # antatt 5 min pr. rad; juster ved annen frekvens
-    return int(best_lag * 5)
+    return int(best_lag * 5)  # antatt 5 min pr rad
 
 
-def mpc_lite_suggest(
-    current_setpoint: float,
-    features: Dict[str, float],
-    arx_coef: Dict[str, float],
-    constraints: Dict[str, float],
-    rate_limit: float = 1.5,
-) -> Tuple[float, Dict[str, float]]:
-    """Ett-trinns fremoversyn: prognose av fukt og valg av nytt setpunkt."""
+def mpc_lite_suggest(current_setpoint: float,
+                     features: Dict[str, float],
+                     arx_coef: Dict[str, float],
+                     constraints: Dict[str, float],
+                     rate_limit: float = 1.5) -> Tuple[float, Dict[str, float]]:
+    """Ett-trinns «MPC-lite»: lineær prognose + begrenset setpunkthopp."""
     y_hat = (
         arx_coef["bias"]
         + arx_coef["k_setpoint"] * current_setpoint
@@ -130,10 +119,11 @@ def mpc_lite_suggest(
         + arx_coef["k_last"] * features.get("bunkerniva_pc", 50.0)
     )
     target = features.get("target_fukt", 1.20)
-    sens = arx_coef.get("k_dset", -0.10)  # %-poeng fukt per +1 °C utløp (negativ typisk)
+    sens = arx_coef.get("k_dset", -0.10)  # %-poeng fukt pr +1°C utløp (typisk negativ)
     delta_needed = (target - y_hat) / sens if abs(sens) > 1e-6 else 0.0
     delta_clamped = float(np.clip(delta_needed, -rate_limit, rate_limit))
-    proposed = float(np.clip(current_setpoint + delta_clamped, constraints["hard_min"], constraints["hard_max"]))
+    proposed = float(np.clip(current_setpoint + delta_clamped,
+                             constraints["hard_min"], constraints["hard_max"]))
     explanation = {
         "prognose_fukt": float(y_hat),
         "mål_fukt": target,
@@ -141,122 +131,120 @@ def mpc_lite_suggest(
         "rå_delta": float(delta_needed),
         "etter_rate_limit": delta_clamped,
         "foreslått_setpunkt": proposed,
-        "bidrag_innlop": float(arx_coef["k_innlop"] * features.get("innlopstemp", 0.0)),
-        "bidrag_mode": float(arx_coef["k_mode"] * features.get("mode", 0.0)),
-        "bidrag_friskluft": float(arx_coef["k_friskluft"] * features.get("friskluftspjeld", 0.0)),
-        "bidrag_last": float(arx_coef["k_last"] * features.get("bunkerniva_pc", 50.0)),
     }
     return proposed, explanation
 
 
 def compute_kpis(df: pd.DataFrame, target: float, window: str = "7D") -> Dict[str, float]:
     recent = df.set_index("timestamp").last(window)
-    if recent.empty:
-        return {"n": 0}
+    if recent.empty: return {"n": 0}
     fukt = recent["fukt_corr"].dropna() if "fukt_corr" in recent.columns else recent["fukt_manuell"].dropna()
     inside = (fukt.between(target - 0.1, target + 0.1)).mean() * 100 if len(fukt) else np.nan
     std = fukt.std() if len(fukt) else np.nan
-    return {
-        "antall_punkt": int(len(fukt)),
-        "std_fukt": float(std) if pd.notnull(std) else np.nan,
-        "andel_innenfor_±0.1pp(%)": float(inside) if pd.notnull(inside) else np.nan,
-    }
+    return {"antall_punkt": int(len(fukt)),
+            "std_fukt": float(std) if pd.notnull(std) else np.nan,
+            "andel_innenfor_±0.1pp(%)": float(inside) if pd.notnull(inside) else np.nan}
 
 
 def add_event(log, level: str, msg: str):
     log.append({"tid": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "nivå": level, "hendelse": msg})
 
 
-# ============ OCR helpers ============ #
+# ================== OCR helpers ================== #
+
+@st.cache_resource(show_spinner=False)
+def _get_easyocr():
+    if easyocr is None: return None
+    try:
+        # «no» er ikke alltid tilgjengelig – tall/latinske bokstaver går fint med 'en','sv','da'
+        return easyocr.Reader(['en','sv','da'])
+    except Exception:
+        return None
+
+def ocr_with_easyocr(image_bytes: bytes) -> str:
+    reader = _get_easyocr()
+    if reader is None: return ""
+    import numpy as np
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    res = reader.readtext(np.array(img), detail=0)  # bare tekst
+    return "\n".join(res)
+
 @st.cache_resource(show_spinner=False)
 def load_trocr_small():
-    """Laster en liten TrOCR-modell hvis tilgjengelig. Returnerer (processor, model) eller (None, None)."""
-    if TrOCRProcessor is None or VisionEncoderDecoderModel is None:
-        return None, None
+    if TrOCRProcessor is None or VisionEncoderDecoderModel is None: return None, None
     try:
-        processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-handwritten")
-        model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-handwritten")
-        model.eval()
-        return processor, model
+        proc = TrOCRProcessor.from_pretrained("microsoft/trocr-small-handwritten")
+        model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-handwritten"); model.eval()
+        return proc, model
     except Exception:
         return None, None
 
+def ocr_with_trocr(image_bytes: bytes) -> str:
+    if TrOCRProcessor is None or VisionEncoderDecoderModel is None or torch is None: return ""
+    proc, model = load_trocr_small()
+    if proc is None: return ""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    with torch.no_grad():
+        ids = model.generate(**proc(img, return_tensors="pt"), max_new_tokens=128)
+    txt = proc.batch_decode(ids, skip_special_tokens=True)[0]
+    return txt or ""
 
-def ocr_with_trocr(img: "Image.Image") -> Optional[str]:
-    if TrOCRProcessor is None or VisionEncoderDecoderModel is None or torch is None:
-        return None
-    processor, model = load_trocr_small()
-    if processor is None:
-        return None
-    try:
-        inputs = processor(img, return_tensors="pt")
-        with torch.no_grad():
-            generated_ids = model.generate(**inputs, max_new_tokens=128)
-        text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        return text
-    except Exception:
-        return None
-
-
-def ocr_with_tesseract(img: "Image.Image") -> Optional[str]:
-    if pytesseract is None:
-        return None
-    try:
-        return pytesseract.image_to_string(img, lang="eng+nor")
-    except Exception:
-        return None
-
+def ocr_with_tesseract(image_bytes: bytes) -> str:
+    if pytesseract is None: return ""
+    img = Image.open(io.BytesIO(image_bytes)).convert("L")
+    # Strammer inn til mest tall/komma/prosent
+    return pytesseract.image_to_string(
+        img, lang="eng", config="--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789.,:%"
+    ) or ""
 
 def ocr_read_image(image_bytes: bytes, backend: str = "auto") -> str:
-    assert Image is not None, "Pillow (PIL) mangler. Installer pillow."
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img_small = img.copy()
-    w, h = img_small.size
-    if max(w, h) > 1800:
-        scale = 1800 / max(w, h)
-        img_small = img_small.resize((int(w*scale), int(h*scale)))
+    if backend in ("auto","easyocr"):
+        t = ocr_with_easyocr(image_bytes)
+        if t.strip(): return t
+    if backend in ("auto","trocr"):
+        t = ocr_with_trocr(image_bytes)
+        if t.strip(): return t
+    if backend in ("auto","tesseract"):
+        t = ocr_with_tesseract(image_bytes)
+        if t.strip(): return t
+    return ""
 
-    text = None
-    if backend in ("auto", "trocr"):
-        text = ocr_with_trocr(img_small)
-    if (text is None or len(text.strip()) == 0) and backend in ("auto", "tesseract"):
-        text = ocr_with_tesseract(img_small)
-    return text or ""
-
-
-def _num(x: str) -> Optional[float]:
-    if x is None:
-        return None
+def _num(x: Optional[str]) -> Optional[float]:
+    if not x: return None
     x = x.replace(" ", "").replace(",", ".")
     try:
         return float(x)
     except Exception:
         return None
 
-
 def parse_log_text(text: str) -> Dict[str, Optional[float]]:
+    """Plukker verdier fra norsk skjema: Utløpstemp, Innløpstemp, Brenner ytelse, Hombak/Maier, Fuktighet tørrspon m.m."""
     import re
     s = text.lower()
     s = s.replace("ø", "o").replace("å", "a").replace("æ", "ae")
-    def rex(p):
+
+    def rex(p):  # første tall-gruppe
         m = re.search(p, s, re.DOTALL)
         return _num(m.group(1)) if m else None
 
     fields = {
-        "utlopstemp": rex(r"utlopstemp[^0-9]*([0-9]{2,3}(?:[.,][0-9])?)"),
-        "innlopstemp": rex(r"innlopstemp[^0-9]*([0-9]{2,3}(?:[.,][0-9])?)"),
-        "friskluftspjeld": rex(r"frisk[^0-9]*([0-9]{1,3}(?:[.,][0-9])?)"),
-        "hombak_pc": rex(r"hombak[^0-9]*([0-9]{1,3})\s?%"),
-        "maier_pc": rex(r"maier[^0-9]*([0-9]{1,3})\s?%"),
-        "bunkerniva_pc": rex(r"bun(?:ker|kerniva)[^0-9]*([0-9]{1,3})"),
-        "fukt_manuell": rex(r"fukt(?:ighet)?[^a-z0-9]{0,10}(?:manuell|prove)?[^0-9]*([0-9](?:[.,][0-9]{1,2})?)"),
-        "fukt_sensor": rex(r"fukt[^\n]*sensor[^0-9]*([0-9](?:[.,][0-9]{1,2})?)"),
-        "trykk_nedre_ovn": rex(r"(?:trykk|undertrykk)[^\n]*nedre[^0-9]*([0-9]{2,4})"),
+        "innlopstemp":  rex(r"innlopstemp[^0-9]*([0-9]{2,3}(?:[.,][0-9])?)"),
+        "brennkammertemp": rex(r"bren(?:n)?kam(?:mer)?[^0-9]*([0-9]{2,4}(?:[.,][0-9])?)"),
+        "utlopstemp_innst": rex(r"innst[^\\n]*utlopstemp[^0-9]*([0-9]{2,3}(?:[.,][0-9])?)"),
+        "utlopstemp":  rex(r"utlopstemp[^0-9]*([0-9]{2,3}(?:[.,][0-9])?)"),
+        "forbrenning_stov": rex(r"forbrenning[^\\n]*stov[^0-9]*([0-9]{1,3})"),
+        "brenner_ytelse":   rex(r"brenner[^\\n]*ytelse[^0-9]*([0-9]{1,3})"),
+        "hombak_pc":        rex(r"utmat(?:ing)?[^\\n]*hombak[^0-9]*([0-9]{1,3})"),
+        "maier_pc":         rex(r"utmat(?:ing)?[^\\n]*maier[^0-9]*([0-9]{1,3})"),
+        "fukt_manuell":     rex(r"fukt(?:ighet)?[^\\n]*torr? s?pon[^0-9]*([0-9](?:[.,][0-9]{1,2})?)"),
+        "fukt_sensor":      rex(r"\\(([0-9](?:[.,][0-9]{1,2})?)\\)"),  # verdien i parentes (sensor)
+        "kontroll_tid":     rex(r"kontroll[^0-9]*kl\\.?[^0-9]*([0-9]{2,4})"),
     }
     return fields
 
 
-# ============ Streamlit UI ============ #
+# ================== UI ================== #
+
 st.set_page_config(page_title="Arbor AI", layout="wide")
 st.title("🌲 Arbor AI – tørkestyring (beta)")
 
@@ -294,7 +282,7 @@ if "cal" not in st.session_state:
 if "events" not in st.session_state:
     st.session_state.events = []
 
-# Data init (demo hvis ingen CSV)
+# Data (demo hvis ingen CSV)
 if csv is not None:
     df = load_csv(csv)
 else:
@@ -323,7 +311,7 @@ else:
         "trykk_nedre_ovn": 275 + rng.normal(0, 5, n),
     })
 
-# Beregn mode + autokalibrering
+# Avledet: mode + RLS-korrigert fukt
 modes, f_corr = [], []
 for _, row in df.iterrows():
     mode = detect_mode(row.get("hombak_pc", 50.0), row.get("maier_pc", 50.0))
@@ -336,10 +324,9 @@ df["mode"], df["fukt_corr"] = modes, f_corr
 
 # Dødtid + KPI
 dead_min = estimate_dead_time_minutes(df, "utlopstemp", "fukt_corr", search_max_min=60)
-next_probe_eta = df["timestamp"].iloc[-1] + timedelta(minutes=dead_min)
 _kpis = compute_kpis(df, target_fukt, window="7D")
 
-# --------- Faner ---------
+# Faner
 tab_dash, tab_kontroll, tab_doe, tab_kpi, tab_logg, tab_ocr, tab_innst = st.tabs(
     ["📊 Dashboard", "🎛️ Kontroll", "🧪 DoE", "🎯 KPI", "📝 Logg", "📸 OCR", "⚙️ Innstillinger"]
 )
@@ -358,12 +345,8 @@ with tab_kontroll:
     current = df.iloc[-1]
     constraints = {"hard_min": float(hard_min), "hard_max": float(hard_max)}
     arx_coef = {
-        "bias": 0.8,
-        "k_setpoint": -0.05,
-        "k_innlop": 0.002,
-        "k_mode": 0.15,
-        "k_friskluft": 0.001,
-        "k_last": -0.002,
+        "bias": 0.8, "k_setpoint": -0.05, "k_innlop": 0.002,
+        "k_mode": 0.15, "k_friskluft": 0.001, "k_last": -0.002,
         "k_dset": sens0,
     }
     features = {
@@ -382,41 +365,28 @@ with tab_kontroll:
         st.warning("Undertrykk under grense – AI fryses midlertidig.")
         proposed, explanation = current_setpoint, {"grunn": "undertrykk"}
     else:
-        proposed, explanation = mpc_lite_suggest(
-            current_setpoint=current_setpoint,
-            features=features,
-            arx_coef=arx_coef,
-            constraints=constraints,
-            rate_limit=rate_limit,
-        )
+        proposed, explanation = mpc_lite_suggest(current_setpoint, features, arx_coef, constraints, rate_limit)
         if mode_ab == "AI (MPC-lite)" and proposed != current_setpoint:
-            add_event(
-                st.session_state.events,
-                "INFO",
-                f"AI foreslår endring {proposed - current_setpoint:+.2f} °C → {proposed:.2f} °C. "
-                f"Årsaker: innløp {features['innlopstemp']} °C, mode {features['mode']:.2f}, "
-                f"frisk {features['friskluftspjeld']}%, last {features['bunkerniva_pc']}%.",
-            )
+            add_event(st.session_state.events, "INFO",
+                      f"AI foreslår {proposed - current_setpoint:+.2f} °C → {proposed:.2f} °C.")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Nåværende utløp", f"{current_setpoint:.2f} °C")
     c2.metric("Foreslått utløp", f"{proposed:.2f} °C")
     c3.metric("Dødtid (est.)", f"~{dead_min} min")
 
-    with st.expander("Forklaring (bidrag)"):
+    with st.expander("Forklaring"):
         st.json(explanation)
 
 with tab_doe:
     st.subheader("Design of Experiments (DoE)")
     with st.form("doe_form"):
-        st.write("Kjør små kontrollerte steg i rolige perioder for å lære sensitivitet pr. resept.")
-        doe_step = st.number_input("Steg (°C)", value=0.5, step=0.1)
-        doe_hold_min = st.number_input("Holdetid (min)", value=30, step=5)
+        step = st.number_input("Steg (°C)", value=0.5, step=0.1)
+        hold = st.number_input("Holdetid (min)", value=30, step=5)
         if st.form_submit_button("Planlegg DoE-sekvens"):
             add_event(st.session_state.events, "PLAN",
-                      f"DoE: steg {doe_step:+.2f} °C, hold {doe_hold_min} min. "
-                      f"Logg fukt før/etter for å oppdatere k_dset.")
-            st.success("DoE-sekvens planlagt (operatørmelding i hendelseslogg).")
+                      f"DoE: steg {step:+.2f} °C, hold {hold} min. Logg fukt før/etter.")
+            st.success("DoE-sekvens planlagt (se hendelseslogg).")
 
 with tab_kpi:
     st.subheader("KPI siste 7 dager")
@@ -430,17 +400,15 @@ with tab_logg:
     evt_df = pd.DataFrame(st.session_state.events)
     st.dataframe(evt_df, use_container_width=True, height=280)
     buf = io.StringIO(); evt_df.to_csv(buf, index=False)
-    st.download_button(
-        label="Last ned hendelseslogg (CSV)",
-        data=buf.getvalue().encode("utf-8"),
-        file_name=f"arbor_ai_hendelser_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-        mime="text/csv",
-    )
+    st.download_button("Last ned hendelseslogg (CSV)",
+                       buf.getvalue().encode("utf-8"),
+                       file_name=f"arbor_ai_hendelser_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                       mime="text/csv")
 
 with tab_ocr:
     st.subheader("OCR – les håndskrevet logg fra bilde")
-    st.caption("Backend: prøver TrOCR (håndskrift) hvis tilgjengelig, ellers pytesseract. Du kan bytte under.")
-    backend = st.radio("OCR-motor", ["auto", "trocr", "tesseract"], horizontal=True)
+    st.caption("Prøver EasyOCR først. Fallback: TrOCR, Tesseract.")
+    backend = st.radio("OCR-motor", ["auto", "easyocr", "trocr", "tesseract"], horizontal=True)
     img_file = st.file_uploader("Last opp bilde av logg (jpg/png)", type=["jpg", "jpeg", "png"])
 
     if img_file is not None:
@@ -448,12 +416,13 @@ with tab_ocr:
         with st.spinner("Leser tekst fra bildet…"):
             text = ocr_read_image(img_bytes, backend=backend)
         if len(text.strip()) == 0:
-            st.error("Fant ikke tekst. Prøv et skarpere bilde eller en annen backend.")
+            st.error("Fant ikke tekst. Prøv EasyOCR, eller ta et skarpere bilde.")
         else:
             st.success("Tekst funnet!")
-            st.text_area("Råtekst fra OCR", value=text, height=180)
+            st.text_area("Råtekst fra OCR", value=text, height=160)
             parsed = parse_log_text(text)
-            st.write("**Tolkede felt (kan redigeres før lagring):**")
+
+            st.write("**Tolkede felt (kan redigeres):**")
             cols = st.columns(3)
             with cols[0]:
                 utlop = st.number_input("Utløpstemp (°C)", value=float(parsed.get("utlopstemp") or 135.0))
@@ -494,15 +463,14 @@ with tab_ocr:
 
 with tab_innst:
     st.subheader("Innstillinger")
-    st.write("Flytt gjerne flere innstillinger hit etter hvert (guardrails per resept, A/B-bryter, mm).")
+    st.write("Flytt flere innstillinger hit etter behov (guardrails per resept, A/B-bryter, mm).")
 
 st.caption(
     """
     Tips:
-    - Koble appen til sanntid ved å erstatte demo-datasettet med stream fra PLC/DCS.
-    - Lær ekte sensitivitet (k_dset) fra DoE: Δfukt / Δutløp → oppdater arx_coef["k_dset"].
-    - Sett ulike guardrails pr. resept og driftsmodus (mode-avhengig rate limit).
-    - Bruk drift-deteksjon (CUSUM) på residualer for å trigge re-kalibrering.
-    - OCR: For best håndskrift, bruk TrOCR. Fallback: pytesseract.
+    - Koble til sanntid (erstatt demo-datasett med PLC/DCS-strøm).
+    - Lær sensitivitet (k_dset) fra DoE: Δfukt / Δutløp → oppdater arx_coef["k_dset"].
+    - Bruk ulike guardrails pr. resept og driftsmodus.
+    - OCR: EasyOCR først. Ved behov: forbedre parseren for akkurat deres skjema.
     """
 )
