@@ -374,3 +374,47 @@ st.caption(
     - Bruk CUSUM/Drift‑deteksjon på residualer for å trigge re‑kalibrering.
     """
 )
+
+tab_dash, tab_kontroll, tab_doe, tab_kpi, tab_logg, tab_innst = st.tabs(
+    ["📊 Dashboard", "🎛️ Kontroll", "🧪 DoE", "🎯 KPI", "📝 Logg", "⚙️ Innstillinger"]
+)
+
+with tab_dash:
+    st.subheader("Trender")
+    st.line_chart(df.set_index("timestamp")[["fukt_sensor","fukt_corr","fukt_manuell"]])
+    st.line_chart(df.set_index("timestamp")[["utlopstemp","innlopstemp","friskluftspjeld"]])
+
+with tab_kontroll:
+    st.subheader("Forslag og guardrails")
+    st.write(f"Nåværende utløpstemp: {current_setpoint:.2f} °C")
+    st.write(f"Foreslått utløpstemp: {proposed:.2f} °C")
+    with st.expander("Forklaring (bidrag)"):
+        st.json(explanation)
+
+with tab_doe:
+    st.subheader("Design of Experiments")
+    with st.form("doe_form"):
+        doe_step = st.number_input("Steg (°C)", value=0.5, step=0.1)
+        doe_hold_min = st.number_input("Holdetid (min)", value=30, step=5)
+        if st.form_submit_button("Planlegg DoE-sekvens"):
+            add_event(st.session_state.events, "PLAN", f"DoE: steg {doe_step:+.2f} °C, hold {doe_hold_min} min.")
+            st.success("DoE-sekvens planlagt.")
+
+with tab_kpi:
+    st.subheader("KPI siste 7 dager")
+    st.metric("Std. fukt", f"{_kpis.get('std_fukt', float('nan')):.3f}")
+    st.metric("Innenfor ±0.1pp", f"{_kpis.get('andel_innenfor_±0.1pp(%)', float('nan')):.1f}%")
+    st.metric("Dødtid (est.)", f"~{dead_min} min")
+
+with tab_logg:
+    st.subheader("Hendelser")
+    evt_df = pd.DataFrame(st.session_state.events)
+    st.dataframe(evt_df, use_container_width=True, height=300)
+    st.download_button("Last ned hendelseslogg (CSV)",
+                       evt_df.to_csv(index=False).encode("utf-8"),
+                       file_name="arbor_ai_hendelser.csv",
+                       mime="text/csv")
+
+with tab_innst:
+    st.subheader("Innstillinger")
+    st.write("Flytt hit RLS-glemselsfaktor, mål-fukt og A/B-bryteren om du vil.")
