@@ -13,7 +13,7 @@ Arbor AI – Streamlit-app med:
 """
 
 import io
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Tuple, Optional
 
 import numpy as np
@@ -88,6 +88,8 @@ def detect_mode(hombak_pc: float, maier_pc: float) -> float:
 
 def estimate_dead_time_minutes(df: pd.DataFrame, col_input: str, col_output: str, search_max_min: int = 60) -> int:
     """Grovt dødtidsestimat via krysskorrelasjon på differanser."""
+    if col_input not in df.columns or col_output not in df.columns or df.empty:
+        return 0
     x = df[col_input].diff().fillna(0).values
     y = df[col_output].diff().fillna(0).values
     n = min(len(x), len(y))
@@ -97,6 +99,8 @@ def estimate_dead_time_minutes(df: pd.DataFrame, col_input: str, col_output: str
         if lag == 0:
             corr = np.corrcoef(x, y)[0, 1] if np.std(x) > 0 and np.std(y) > 0 else 0
         else:
+            if n - lag <= 3:
+                break
             corr = np.corrcoef(x[:-lag], y[lag:])[0, 1] if np.std(x[:-lag]) > 0 and np.std(y[lag:]) > 0 else 0
         if np.isnan(corr): corr = 0
         if corr > best_corr:
@@ -136,14 +140,24 @@ def mpc_lite_suggest(current_setpoint: float,
 
 
 def compute_kpis(df: pd.DataFrame, target: float, window: str = "7D") -> Dict[str, float]:
-    end = df["timestamp"].max() start = end - pd.Timedelta(window) recent = df.loc[df["timestamp"].between(start, end)].set_index("timestamp")
-    if recent.empty: return {"n": 0}
+    """Fjerner .last() deprecation og tåler tomt datasett."""
+    if "timestamp" not in df.columns or df.empty:
+        return {"n": 0}
+    end = df["timestamp"].max()
+    if pd.isna(end):
+        return {"n": 0}
+    start = end - pd.Timedelta(window)
+    recent = df.loc[df["timestamp"].between(start, end)]
+    if recent.empty:
+        return {"n": 0}
     fukt = recent["fukt_corr"].dropna() if "fukt_corr" in recent.columns else recent["fukt_manuell"].dropna()
     inside = (fukt.between(target - 0.1, target + 0.1)).mean() * 100 if len(fukt) else np.nan
     std = fukt.std() if len(fukt) else np.nan
-    return {"antall_punkt": int(len(fukt)),
-            "std_fukt": float(std) if pd.notnull(std) else np.nan,
-            "andel_innenfor_±0.1pp(%)": float(inside) if pd.notnull(inside) else np.nan}
+    return {
+        "antall_punkt": int(len(fukt)),
+        "std_fukt": float(std) if pd.notnull(std) else np.nan,
+        "andel_innenfor_±0.1pp(%)": float(inside) if pd.notnull(inside) else np.nan,
+    }
 
 
 def add_event(log, level: str, msg: str):
@@ -154,63 +168,88 @@ def add_event(log, level: str, msg: str):
 
 @st.cache_resource(show_spinner=False)
 def _get_easyocr():
-    if easyocr is None: return None
+    if easyocr is None:
+        return None
     try:
         # «no» er ikke alltid tilgjengelig – tall/latinske bokstaver går fint med 'en','sv','da'
-        return easyocr.Reader(['en','sv','da'])
-    except Exception:
+        return easyocr.Reader(['en', 'sv', 'da'], gpu=False)
+    except Exception as e:
+        st.session_state['easyocr_init_error'] = str(e)
         return None
 
 def ocr_with_easyocr(image_bytes: bytes) -> str:
     reader = _get_easyocr()
-    if reader is None: return ""
-    import numpy as np
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    res = reader.readtext(np.array(img), detail=0)  # bare tekst
-    return "\n".join(res)
+    if reader is None or Image is None:
+        return ""
+    try:
+        import numpy as np
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        res = reader.readtext(np.array(img), detail=0)  # bare tekst
+        return "\n".join(res)
+    except Exception as e:
+        st.session_state['easyocr_run_error'] = str(e)
+        return ""
 
 @st.cache_resource(show_spinner=False)
 def load_trocr_small():
-    if TrOCRProcessor is None or VisionEncoderDecoderModel is None: return None, None
+    if TrOCRProcessor is None or VisionEncoderDecoderModel is None or torch is None:
+        return None, None
     try:
         proc = TrOCRProcessor.from_pretrained("microsoft/trocr-small-handwritten")
-        model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-handwritten"); model.eval()
+        model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-handwritten")
+        model.eval()
         return proc, model
-    except Exception:
+    except Exception as e:
+        st.session_state['trocr_init_error'] = str(e)
         return None, None
 
 def ocr_with_trocr(image_bytes: bytes) -> str:
-    if TrOCRProcessor is None or VisionEncoderDecoderModel is None or torch is None: return ""
+    if TrOCRProcessor is None or VisionEncoderDecoderModel is None or torch is None or Image is None:
+        return ""
     proc, model = load_trocr_small()
-    if proc is None: return ""
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    with torch.no_grad():
-        ids = model.generate(**proc(img, return_tensors="pt"), max_new_tokens=128)
-    txt = proc.batch_decode(ids, skip_special_tokens=True)[0]
-    return txt or ""
+    if proc is None:
+        return ""
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        with torch.no_grad():
+            ids = model.generate(**proc(img, return_tensors="pt"), max_new_tokens=128)
+        txt = proc.batch_decode(ids, skip_special_tokens=True)[0]
+        return txt or ""
+    except Exception as e:
+        st.session_state['trocr_run_error'] = str(e)
+        return ""
 
 def ocr_with_tesseract(image_bytes: bytes) -> str:
-    if pytesseract is None: return ""
-    img = Image.open(io.BytesIO(image_bytes)).convert("L")
-    # Strammer inn til mest tall/komma/prosent
-    return pytesseract.image_to_string(
-        img, lang="eng", config="--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789.,:%"
-    ) or ""
+    if pytesseract is None or Image is None:
+        return ""
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("L")
+        # Strammer inn til mest tall/komma/prosent
+        return pytesseract.image_to_string(
+            img, lang="eng", config="--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789.,:%"
+        ) or ""
+    except Exception as e:
+        st.session_state['tesseract_run_error'] = str(e)
+        return ""
 
 def ocr_read_image(image_bytes: bytes, backend: str = "auto") -> str:
-    if backend in ("auto","easyocr"):
+    if backend in ("auto", "easyocr"):
         t = ocr_with_easyocr(image_bytes)
-        if t.strip(): return t
-    if backend in ("auto","trocr"):
+        if t.strip():
+            return t
+    if backend in ("auto", "trocr"):
         t = ocr_with_trocr(image_bytes)
-        if t.strip(): return t
-    if backend in ("auto","tesseract"):
+        if t.strip():
+            return t
+    if backend in ("auto", "tesseract"):
         t = ocr_with_tesseract(image_bytes)
-        if t.strip(): return t
+        if t.strip():
+            return t
     return ""
 
 def _num(x: Optional[str]) -> Optional[float]:
-    if not x: return None
+    if not x:
+        return None
     x = x.replace(" ", "").replace(",", ".")
     try:
         return float(x)
@@ -237,8 +276,8 @@ def parse_log_text(text: str) -> Dict[str, Optional[float]]:
         "hombak_pc":        rex(r"utmat(?:ing)?[^\\n]*hombak[^0-9]*([0-9]{1,3})"),
         "maier_pc":         rex(r"utmat(?:ing)?[^\\n]*maier[^0-9]*([0-9]{1,3})"),
         "fukt_manuell":     rex(r"fukt(?:ighet)?[^\\n]*torr? s?pon[^0-9]*([0-9](?:[.,][0-9]{1,2})?)"),
-        "fukt_sensor":      rex(r"\\(([0-9](?:[.,][0-9]{1,2})?)\\)"),  # verdien i parentes (sensor)
-        "kontroll_tid":     rex(r"kontroll[^0-9]*kl\\.?[^0-9]*([0-9]{2,4})"),
+        "fukt_sensor":      rex(r"\(([0-9](?:[.,][0-9]{1,2})?)\)"),  # verdien i parentes (sensor)
+        "kontroll_tid":     rex(r"kontroll[^0-9]*kl\.?[^0-9]*([0-9]{2,4})"),
     }
     return fields
 
@@ -383,10 +422,11 @@ with tab_doe:
     with st.form("doe_form_v2", clear_on_submit=False):
         step = st.number_input("Steg (°C)", value=0.5, step=0.1)
         hold = st.number_input("Holdetid (min)", value=30, step=5)
-        if st.form_submit_button("Planlegg DoE-sekvens"):
-            add_event(st.session_state.events, "PLAN",
-                      f"DoE: steg {step:+.2f} °C, hold {hold} min. Logg fukt før/etter.")
-            st.success("DoE-sekvens planlagt (se hendelseslogg).")
+        send = st.form_submit_button("Planlegg DoE-sekvens")
+    if send:
+        add_event(st.session_state.events, "PLAN",
+                  f"DoE: steg {step:+.2f} °C, hold {hold} min. Logg fukt før/etter.")
+        st.success("DoE-sekvens planlagt (se hendelseslogg).")
 
 with tab_kpi:
     st.subheader("KPI siste 7 dager")
@@ -415,6 +455,12 @@ with tab_ocr:
         img_bytes = img_file.read()
         with st.spinner("Leser tekst fra bildet…"):
             text = ocr_read_image(img_bytes, backend=backend)
+
+        # Vis eventuelle init-/run-feil (for feilsøking på Cloud)
+        for k in ["easyocr_init_error", "easyocr_run_error", "trocr_init_error", "trocr_run_error", "tesseract_run_error"]:
+            if k in st.session_state:
+                st.info(f"{k}: {st.session_state[k]}")
+
         if len(text.strip()) == 0:
             st.error("Fant ikke tekst. Prøv EasyOCR, eller ta et skarpere bilde.")
         else:
