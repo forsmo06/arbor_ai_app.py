@@ -136,7 +136,7 @@ def mpc_lite_suggest(current_setpoint: float,
 
 
 def compute_kpis(df: pd.DataFrame, target: float, window: str = "7D") -> Dict[str, float]:
-    recent = df.set_index("timestamp").last(window)
+    end = df["timestamp"].max() start = end - pd.Timedelta(window) recent = df.loc[df["timestamp"].between(start, end)].set_index("timestamp")
     if recent.empty: return {"n": 0}
     fukt = recent["fukt_corr"].dropna() if "fukt_corr" in recent.columns else recent["fukt_manuell"].dropna()
     inside = (fukt.between(target - 0.1, target + 0.1)).mean() * 100 if len(fukt) else np.nan
@@ -380,7 +380,7 @@ with tab_kontroll:
 
 with tab_doe:
     st.subheader("Design of Experiments (DoE)")
-    with st.form("doe_form"):
+    with st.form("doe_form_v2", clear_on_submit=False):
         step = st.number_input("Steg (°C)", value=0.5, step=0.1)
         hold = st.number_input("Holdetid (min)", value=30, step=5)
         if st.form_submit_button("Planlegg DoE-sekvens"):
